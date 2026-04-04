@@ -1,4 +1,4 @@
-import org.apache.hadoop.fs.permission.{FsAction, FsPermission}
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.hbase.client.{
   Connection,
@@ -21,14 +21,24 @@ object HbaseBulkLoadUtil {
     "hbase.mapreduce.hfileoutputformat.table.name"
 
   def main(args: Array[String]): Unit = {
-    // TODO: 在此添加启动逻辑
     println("HbaseBulkLoadUtil started")
     val spark = SparkSession
       .builder()
       .appName("HbaseBulkLoadUtil")
-      .master("local[*]")
+      .enableHiveSupport()
       .getOrCreate()
 
+    val df = spark.sql(
+      """SELECT id, name, age, city
+        |FROM default.user_info
+        |WHERE dt = '2026-04-04'
+        |""".stripMargin
+    )
+
+    bulkLoad(spark, df, "default:user_info_hbase", "cf", "id")
+
+    spark.stop()
+    println("HbaseBulkLoadUtil finished")
   }
 
   /** Spark DataFrame 批量卸数至 HBase 2.4.5
@@ -37,20 +47,19 @@ object HbaseBulkLoadUtil {
     *   1. 单次 shuffle：用 Region 感知分区器 + repartitionAndSortWithinPartitions 替代
     *      repartition + sortBy 双 shuffle
     *   2. 资源安全关闭：hTable / regionLocator / connection 全部在 finally 中释放
-    *   3. 递归赋权修复：子目录 + 文件统一处理，不再遗漏中间目录
-    *   4. 临时目录统一在 /user/aiip_001 下，匹配集群权限分配
+    *   3. staging 目录可配置，避免隐式访问无权限路径
     */
   def bulkLoad(
       spark: SparkSession,
       df: DataFrame,
       tableNameStr: String,
       columnFamily: String,
-      rowKeyCol: String
+      rowKeyCol: String,
+      userBase: String = "/user/aiip_001",
+      timestamp: Long = System.currentTimeMillis()
   ): Unit = {
 
-    // 所有临时目录统一在 /user/aiip_001 下，匹配集群已授权路径
-    val userBase = "/user/aiip_001"
-    val ts = System.currentTimeMillis()
+    val ts = timestamp
     val safeTableName = tableNameStr.replace(":", "_")
     val hdfsTempPath = s"$userBase/bulkload_tmp/${safeTableName}_$ts"
 
@@ -62,53 +71,13 @@ object HbaseBulkLoadUtil {
     val hbaseConf = HBaseConfiguration.create(sparkHadoopConf)
     hbaseConf.set(OUTPUT_TABLE_NAME_CONF_KEY, tableNameStr)
     hbaseConf.setInt("hbase.bulkload.retries.number", 100)
-    // --- MapReduce / YARN staging 目录 (解决 /user/hadoop 权限问题的关键) ---
-    hbaseConf.set(
-      "mapreduce.jobtracker.staging.root.dir",
-      s"$userBase/.staging/mapred"
-    )
-    hbaseConf.set(
-      "yarn.app.mapreduce.am.staging-dir",
-      s"$userBase/.staging/yarn"
-    )
-    hbaseConf.set("hadoop.tmp.dir", s"$userBase/.staging/hadoop_tmp")
-
-    // --- HBase BulkLoad staging ---
     hbaseConf.set(
       "hbase.bulkload.staging.dir",
       s"$userBase/.staging/hbase_bulkload"
     )
-
-    // --- 以下三项也可能隐式访问 /user/hadoop，一并拦截 ---
-    hbaseConf.set("mapreduce.cluster.local.dir", s"$userBase/.staging/local")
-    hbaseConf.set("mapreduce.job.local.dir", s"$userBase/.staging/job_local")
-    hbaseConf.set(
-      "mapreduce.cluster.temp.dir",
-      s"$userBase/.staging/cluster_tmp"
-    )
-
-    // 同步写入 Spark 的 hadoopConfiguration，确保 Spark 创建的 Job 也继承这些路径
-    sparkHadoopConf.set(
-      "mapreduce.jobtracker.staging.root.dir",
-      s"$userBase/.staging/mapred"
-    )
-    sparkHadoopConf.set(
-      "yarn.app.mapreduce.am.staging-dir",
-      s"$userBase/.staging/yarn"
-    )
-    sparkHadoopConf.set("hadoop.tmp.dir", s"$userBase/.staging/hadoop_tmp")
-    sparkHadoopConf.set(
-      "mapreduce.cluster.local.dir",
-      s"$userBase/.staging/local"
-    )
-    sparkHadoopConf.set(
-      "mapreduce.job.local.dir",
-      s"$userBase/.staging/job_local"
-    )
-    sparkHadoopConf.set(
-      "mapreduce.cluster.temp.dir",
-      s"$userBase/.staging/cluster_tmp"
-    )
+    // 统一设置 staging 目录，解决 /user/hadoop 权限问题
+    setStagingDirs(hbaseConf, userBase)
+    setStagingDirs(sparkHadoopConf, userBase)
 
     // ========================================
     // 3. 提取列名并严格按字典序排列
@@ -192,76 +161,67 @@ object HbaseBulkLoadUtil {
         classOf[HFileOutputFormat2],
         job.getConfiguration
       )
-      // ================================
       println("[BulkLoad] HFile生成完毕")
 
-      // 7. HDFS 赋权（递归处理目录+文件）
       // ========================================
-      // 与 HFile 写出阶段共用同一份配置，避免 chmod/delete 指向不同的 FS。
-      val fs = FileSystem.get(job.getConfiguration)
-      val tempPath = new Path(hdfsTempPath)
-      val perm775 = new FsPermission(
-        FsAction.ALL,
-        FsAction.READ_EXECUTE,
-        FsAction.READ_EXECUTE
-      )
-      chmodRecursive(fs, tempPath, perm775)
-      println("[BulkLoad] HDFS目录赋权完毕")
-
-      // ========================================
-      // 8. BulkLoad 导入 HBase
+      // 7. BulkLoad 导入 HBase
       // ========================================
       println("[BulkLoad] 开始BulkLoad导入...")
+      val fs = FileSystem.get(job.getConfiguration)
+      val tempPath = new Path(hdfsTempPath)
       val bulkLoader = BulkLoadHFiles.create(job.getConfiguration)
       bulkLoader.bulkLoad(targetTable, tempPath)
       println(s"[BulkLoad] 导入完成! 表: $tableNameStr")
+
+      // 清理 HFile 临时目录
+      if (fs.exists(tempPath)) {
+        fs.delete(tempPath, true)
+        println(s"[BulkLoad] 临时目录已清理: $hdfsTempPath")
+      }
 
     } catch {
       case e: Exception =>
         System.err.println(s"[BulkLoad] 失败: ${e.getMessage}")
         e.printStackTrace()
+        // 异常时也尝试清理临时目录
+        try {
+          val fs = FileSystem.get(hbaseConf)
+          val tempPath = new Path(hdfsTempPath)
+          if (fs.exists(tempPath)) {
+            fs.delete(tempPath, true)
+            println(s"[BulkLoad] 临时目录已清理: $hdfsTempPath")
+          }
+        } catch {
+          case ce: Exception =>
+            System.err.println(s"[BulkLoad] 清理临时目录失败: ${ce.getMessage}")
+        }
         throw e
     } finally {
       // 按获取的逆序关闭，避免资源泄漏
       closeQuietly(regionLocator)
       closeQuietly(hTable)
       closeQuietly(connection)
-
-      // 清理 HFile 临时目录
-      try {
-        val fs = FileSystem.get(hbaseConf)
-        val tempPath = new Path(hdfsTempPath)
-        if (fs.exists(tempPath)) {
-          fs.delete(tempPath, true)
-          println(s"[BulkLoad] 临时目录已清理: $hdfsTempPath")
-        }
-      } catch {
-        case e: Exception =>
-          System.err.println(s"[BulkLoad] 清理临时目录失败: ${e.getMessage}")
-      }
     }
   }
 
-  /** 递归赋权：先处理当前路径，再遍历子目录和文件 修复原版 listFiles 只返回文件、遗漏子目录的问题
-    */
-  private def chmodRecursive(
-      fs: FileSystem,
-      path: Path,
-      perm: FsPermission
-  ): Unit = {
-    fs.setPermission(path, perm)
-    if (fs.getFileStatus(path).isDirectory) {
-      fs.listStatus(path).foreach { status =>
-        chmodRecursive(fs, status.getPath, perm)
-      }
-    }
+  /** 统一设置 staging 目录，避免隐式访问 /user/hadoop */
+  private def setStagingDirs(conf: Configuration, base: String): Unit = {
+    conf.set("mapreduce.jobtracker.staging.root.dir", s"$base/.staging/mapred")
+    conf.set("yarn.app.mapreduce.am.staging-dir", s"$base/.staging/yarn")
+    conf.set("hadoop.tmp.dir", s"$base/.staging/hadoop_tmp")
+    conf.set("mapreduce.cluster.local.dir", s"$base/.staging/local")
+    conf.set("mapreduce.job.local.dir", s"$base/.staging/job_local")
+    conf.set("mapreduce.cluster.temp.dir", s"$base/.staging/cluster_tmp")
   }
 
-  /** 安全关闭资源，忽略异常 */
+  /** 安全关闭资源，异常时打印警告 */
   private def closeQuietly(closeable: AutoCloseable): Unit = {
     if (closeable != null) {
       try { closeable.close() }
-      catch { case _: Exception => }
+      catch {
+        case e: Exception =>
+          System.err.println(s"[BulkLoad] 关闭资源异常: ${e.getMessage}")
+      }
     }
   }
 }
@@ -272,6 +232,8 @@ object HbaseBulkLoadUtil {
   * repartitionAndSortWithinPartitions 实现单次 shuffle 完成分区+排序。
   */
 class RegionPartitioner(splitKeys: Array[Array[Byte]]) extends Partitioner {
+
+  require(splitKeys.nonEmpty, "splitKeys must not be empty")
 
   override def numPartitions: Int = splitKeys.length
 
@@ -303,7 +265,19 @@ class RegionPartitioner(splitKeys: Array[Array[Byte]]) extends Partitioner {
 
 }
 
-final case class BulkLoadSortKey(rowKey: Array[Byte], qualifier: Array[Byte])
+final case class BulkLoadSortKey(rowKey: Array[Byte], qualifier: Array[Byte]) {
+
+  override def equals(obj: Any): Boolean = obj match {
+    case that: BulkLoadSortKey =>
+      java.util.Arrays.equals(this.rowKey, that.rowKey) &&
+        java.util.Arrays.equals(this.qualifier, that.qualifier)
+    case _ => false
+  }
+
+  override def hashCode(): Int = {
+    31 * java.util.Arrays.hashCode(rowKey) + java.util.Arrays.hashCode(qualifier)
+  }
+}
 
 object BulkLoadSortKey {
   val ordering: Ordering[BulkLoadSortKey] = (a, b) => {
