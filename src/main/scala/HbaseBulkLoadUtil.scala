@@ -57,7 +57,9 @@ object HbaseBulkLoadUtil {
     // ========================================
     // 2. HBase / MapReduce 参数配置
     // ========================================
-    val hbaseConf = HBaseConfiguration.create()
+    val sparkHadoopConf = spark.sparkContext.hadoopConfiguration
+    // 从 Spark 已生效的 Hadoop 配置派生，避免 HBase / FS / Job 使用不同集群上下文。
+    val hbaseConf = HBaseConfiguration.create(sparkHadoopConf)
     hbaseConf.set(OUTPUT_TABLE_NAME_CONF_KEY, tableNameStr)
     hbaseConf.setInt("hbase.bulkload.retries.number", 100)
     // --- MapReduce / YARN staging 目录 (解决 /user/hadoop 权限问题的关键) ---
@@ -86,7 +88,6 @@ object HbaseBulkLoadUtil {
     )
 
     // 同步写入 Spark 的 hadoopConfiguration，确保 Spark 创建的 Job 也继承这些路径
-    val sparkHadoopConf = spark.sparkContext.hadoopConfiguration
     sparkHadoopConf.set(
       "mapreduce.jobtracker.staging.root.dir",
       s"$userBase/.staging/mapred"
@@ -120,7 +121,7 @@ object HbaseBulkLoadUtil {
     println(s"[BulkLoad] HFile临时路径: $hdfsTempPath")
 
     // ========================================
-    // 4. DataFrame -> (ImmutableBytesWritable, KeyValue)
+    // 4. DataFrame -> (BulkLoadSortKey, KeyValue)
     // ========================================
     val hbaseRdd = df.rdd.flatMap { row =>
       val rowKeyVal = row.getAs[Any](rowKeyCol)
@@ -128,18 +129,19 @@ object HbaseBulkLoadUtil {
         Iterator.empty
       } else {
         val rkBytes = Bytes.toBytes(rowKeyVal.toString)
-        val ibw = new ImmutableBytesWritable(rkBytes)
         sortedColumns.iterator.flatMap { colName =>
           val value = row.getAs[Any](colName)
           if (value != null) {
+            val qualifierBytes = Bytes.toBytes(colName)
             val kv = new KeyValue(
               rkBytes,
               cfBytes,
-              Bytes.toBytes(colName),
+              qualifierBytes,
               ts, // 统一时间戳，保证同批数据版本一致
               Bytes.toBytes(value.toString)
             )
-            Iterator.single((ibw, kv))
+            // 先携带 rowKey + qualifier 排序，确保同一行内的 Cell 顺序满足 HFile 要求。
+            Iterator.single((BulkLoadSortKey(rkBytes, qualifierBytes), kv))
           } else {
             Iterator.empty
           }
@@ -170,17 +172,14 @@ object HbaseBulkLoadUtil {
 
       // 单次 shuffle: Region 感知分区 + 分区内排序
       val partitioner = new RegionPartitioner(startKeys)
-      implicit val ordering: Ordering[ImmutableBytesWritable] = (a, b) => {
-        Bytes.compareTo(
-          a.get(),
-          a.getOffset,
-          a.getLength,
-          b.get(),
-          b.getOffset,
-          b.getLength
-        )
-      }
-      val sortedRdd = hbaseRdd.repartitionAndSortWithinPartitions(partitioner)
+      implicit val ordering: Ordering[BulkLoadSortKey] =
+        BulkLoadSortKey.ordering
+      val sortedRdd = hbaseRdd
+        .repartitionAndSortWithinPartitions(partitioner)
+        .map { case (sortKey, kv) =>
+          // 排序完成后再还原成 HFileOutputFormat2 需要的 rowKey 输出键。
+          (new ImmutableBytesWritable(sortKey.rowKey), kv)
+        }
 
       // ========================================
       // 6. 写出 HFile
@@ -198,7 +197,8 @@ object HbaseBulkLoadUtil {
 
       // 7. HDFS 赋权（递归处理目录+文件）
       // ========================================
-      val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
+      // 与 HFile 写出阶段共用同一份配置，避免 chmod/delete 指向不同的 FS。
+      val fs = FileSystem.get(job.getConfiguration)
       val tempPath = new Path(hdfsTempPath)
       val perm775 = new FsPermission(
         FsAction.ALL,
@@ -229,7 +229,7 @@ object HbaseBulkLoadUtil {
 
       // 清理 HFile 临时目录
       try {
-        val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
+        val fs = FileSystem.get(hbaseConf)
         val tempPath = new Path(hdfsTempPath)
         if (fs.exists(tempPath)) {
           fs.delete(tempPath, true)
@@ -276,8 +276,12 @@ class RegionPartitioner(splitKeys: Array[Array[Byte]]) extends Partitioner {
   override def numPartitions: Int = splitKeys.length
 
   override def getPartition(key: Any): Int = {
-    val ibw = key.asInstanceOf[ImmutableBytesWritable]
-    val rowKey = Bytes.copy(ibw.get(), ibw.getOffset, ibw.getLength)
+    val rowKey = key match {
+      case ibw: ImmutableBytesWritable =>
+        Bytes.copy(ibw.get(), ibw.getOffset, ibw.getLength)
+      case sortKey: BulkLoadSortKey =>
+        sortKey.rowKey
+    }
 
     // 二分查找：找到 rowKey 所属的 Region
     var low = 1 // splitKeys(0) 是空字节数组，跳过
@@ -297,4 +301,18 @@ class RegionPartitioner(splitKeys: Array[Array[Byte]]) extends Partitioner {
     region
   }
 
+}
+
+final case class BulkLoadSortKey(rowKey: Array[Byte], qualifier: Array[Byte])
+
+object BulkLoadSortKey {
+  val ordering: Ordering[BulkLoadSortKey] = (a, b) => {
+    val rowCompare = Bytes.compareTo(a.rowKey, b.rowKey)
+    if (rowCompare != 0) {
+      rowCompare
+    } else {
+      // 同一 rowKey 下继续按 qualifier 排序，保证 Cell 写入顺序稳定。
+      Bytes.compareTo(a.qualifier, b.qualifier)
+    }
+  }
 }
