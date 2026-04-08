@@ -48,6 +48,12 @@ object HbaseBulkLoadUtil {
     *      repartition + sortBy 双 shuffle
     *   2. 资源安全关闭：hTable / regionLocator / connection 全部在 finally 中释放
     *   3. staging 目录可配置，避免隐式访问无权限路径
+    *
+    * ZooKeeper 配置说明：
+    *   HBase ZK 地址不会从 Spark 环境自动注入，需通过以下任一方式提供：
+    *   - 参数 zkQuorum 显式传入（优先级最高）
+    *   - spark-submit --conf spark.hadoop.hbase.zookeeper.quorum=<hosts>
+    *   - 将 hbase-site.xml 放入 spark.driver/executor.extraClassPath
     */
   def bulkLoad(
       spark: SparkSession,
@@ -56,7 +62,10 @@ object HbaseBulkLoadUtil {
       columnFamily: String,
       rowKeyCol: String,
       userBase: String = "/user/aiip_001",
-      timestamp: Long = System.currentTimeMillis()
+      timestamp: Long = System.currentTimeMillis(),
+      zkQuorum: String = null,
+      zkPort: String = "2181",
+      zkZnodeParent: String = "/hbase"
   ): Unit = {
 
     val ts = timestamp
@@ -68,7 +77,36 @@ object HbaseBulkLoadUtil {
     // ========================================
     val sparkHadoopConf = spark.sparkContext.hadoopConfiguration
     // 从 Spark 已生效的 Hadoop 配置派生，避免 HBase / FS / Job 使用不同集群上下文。
+    // 注意：hbase-site.xml 不会自动加载到 sparkHadoopConf，ZK 地址需显式配置。
     val hbaseConf = HBaseConfiguration.create(sparkHadoopConf)
+
+    // ---- ZooKeeper 地址解析（优先级：显式参数 > spark.hadoop.* > hbase-site.xml on classpath）----
+    val resolvedZkQuorum: String = Option(zkQuorum).filter(_.nonEmpty).getOrElse {
+      // spark-submit --conf spark.hadoop.hbase.zookeeper.quorum=xxx 会写入 spark.conf
+      spark.conf
+        .getOption("spark.hadoop.hbase.zookeeper.quorum")
+        .filter(_.nonEmpty)
+        .getOrElse {
+          // 最后尝试 hbase-site.xml 是否已在 classpath 上生效
+          val fromClasspath = hbaseConf.get("hbase.zookeeper.quorum", "")
+          if (fromClasspath.nonEmpty && fromClasspath != "localhost") {
+            fromClasspath
+          } else {
+            throw new IllegalArgumentException(
+              "[BulkLoad] hbase.zookeeper.quorum 未配置，HBase 连接将失败。" +
+                "请通过以下任一方式提供：\n" +
+                "  1. bulkLoad(..., zkQuorum = \"zk1,zk2,zk3\")\n" +
+                "  2. spark-submit --conf spark.hadoop.hbase.zookeeper.quorum=zk1,zk2,zk3\n" +
+                "  3. 将 hbase-site.xml 加入 --files 并配置 extraClassPath"
+            )
+          }
+        }
+    }
+
+    hbaseConf.set("hbase.zookeeper.quorum", resolvedZkQuorum)
+    hbaseConf.set("hbase.zookeeper.property.clientPort", zkPort)
+    hbaseConf.set("zookeeper.znode.parent", zkZnodeParent)
+    println(s"[BulkLoad] ZooKeeper: $resolvedZkQuorum:$zkPort, znodeParent: $zkZnodeParent")
     hbaseConf.set(OUTPUT_TABLE_NAME_CONF_KEY, tableNameStr)
     hbaseConf.setInt("hbase.bulkload.retries.number", 100)
     hbaseConf.set(
