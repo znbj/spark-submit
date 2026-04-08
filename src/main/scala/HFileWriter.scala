@@ -1,4 +1,4 @@
-import org.apache.hadoop.hbase.{HBaseConfiguration, KeyValue, TableName}
+import org.apache.hadoop.hbase.{CellUtil, HBaseConfiguration, KeyValue, TableName}
 import org.apache.hadoop.hbase.client.ConnectionFactory
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable
 import org.apache.hadoop.hbase.mapreduce.HFileOutputFormat2
@@ -76,8 +76,12 @@ object HFileWriter {
       }
 
       // 4. 按 rowkey、qualifier 字节序全局排序（HFileOutputFormat2 强制要求有序输入）
-      implicit val byteOrd: Ordering[Array[Byte]] = (a, b) => Bytes.compareTo(a, b)
-      val sorted = kvRdd.sortBy { case (k, kv) => (k.get(), kv.getQualifier) }
+      // Scala 2.12 对 trait SAM 推断不稳定，用匿名类显式实现 Ordering
+      implicit val byteOrd: Ordering[Array[Byte]] = new Ordering[Array[Byte]] {
+        override def compare(a: Array[Byte], b: Array[Byte]): Int = Bytes.compareTo(a, b)
+      }
+      // HBase 2.x KeyValue 无 getQualifier()，用 CellUtil.cloneQualifier
+      val sorted = kvRdd.sortBy { case (k, kv) => (k.get(), CellUtil.cloneQualifier(kv)) }
 
       // 5. 写出 HFile
       sorted.saveAsNewAPIHadoopFile(
