@@ -34,13 +34,16 @@ object HFileWriter {
   ): Unit = {
 
     // 1. HBase 配置
-    val conf = HBaseConfiguration.create(spark.sparkContext.hadoopConfiguration)
+    val sparkHadoopConf = spark.sparkContext.hadoopConfiguration
+    val conf = HBaseConfiguration.create(sparkHadoopConf)
     conf.set("hbase.zookeeper.quorum", zkQuorum)
     conf.set("hbase.zookeeper.property.clientPort", zkPort)
-    // staging 目录定向到有权限的路径，避免访问 /user/hadoop
-    conf.set("yarn.app.mapreduce.am.staging-dir", s"$userDir/.staging/yarn")
-    conf.set("mapreduce.jobtracker.staging.root.dir", s"$userDir/.staging/mapred")
-    conf.set("hadoop.tmp.dir", s"$userDir/.staging/tmp")
+    // staging 目录定向到有权限的路径，避免访问 /user/hadoop。
+    // 必须同时设置 conf 和 sparkHadoopConf：
+    //   conf          -> Job.getInstance(conf) -> saveAsNewAPIHadoopFile 的 outputFormat 配置
+    //   sparkHadoopConf -> Spark task 执行时合并进 task 配置，若不设则集群默认覆盖上面的设置
+    setStagingDirs(conf, userDir)
+    setStagingDirs(sparkHadoopConf, userDir)
 
     // 2. 连接 HBase，configureIncrementalLoad 会从表的列族读取压缩、BloomFilter 等参数
     val tn = TableName.valueOf(tableName)
@@ -99,5 +102,14 @@ object HFileWriter {
       table.close()
       connection.close()
     }
+  }
+
+  private def setStagingDirs(conf: org.apache.hadoop.conf.Configuration, base: String): Unit = {
+    conf.set("yarn.app.mapreduce.am.staging-dir", s"$base/.staging/yarn")
+    conf.set("mapreduce.jobtracker.staging.root.dir", s"$base/.staging/mapred")
+    conf.set("hadoop.tmp.dir", s"$base/.staging/tmp")
+    conf.set("mapreduce.cluster.local.dir", s"$base/.staging/local")
+    conf.set("mapreduce.job.local.dir", s"$base/.staging/job_local")
+    conf.set("mapreduce.cluster.temp.dir", s"$base/.staging/cluster_tmp")
   }
 }
