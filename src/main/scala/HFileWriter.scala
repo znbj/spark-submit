@@ -1,4 +1,4 @@
-import org.apache.hadoop.hbase.{CellUtil, HBaseConfiguration, KeyValue, TableName}
+import org.apache.hadoop.hbase.{CellUtil, HBaseConfiguration, HConstants, KeyValue, TableName}
 import org.apache.hadoop.hbase.client.ConnectionFactory
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable
 import org.apache.hadoop.hbase.mapreduce.HFileOutputFormat2
@@ -19,7 +19,7 @@ object HFileWriter {
    * @param rowKeyCol     作为 RowKey 的列名
    * @param outputPath    HFile 输出路径，如 "/user/aiip/hfile/user_info"
    * @param zkPort        ZooKeeper 端口，默认 2181
-   * @param userDir       当前用户 HDFS 根目录，用于 staging，默认 /user/aiip
+   * @param userDir       当前用户 HDFS 根目录，用于 staging，默认 /user/aiip_001
    */
   def write(
       spark: SparkSession,
@@ -30,7 +30,7 @@ object HFileWriter {
       rowKeyCol: String,
       outputPath: String,
       zkPort: String = "2181",
-      userDir: String = "/user/aiip"
+      userDir: String = "/user/aiip_001"
   ): Unit = {
 
     // 1. HBase 配置
@@ -44,6 +44,11 @@ object HFileWriter {
     //   sparkHadoopConf -> Spark task 执行时合并进 task 配置，若不设则集群默认覆盖上面的设置
     setStagingDirs(conf, userDir)
     setStagingDirs(sparkHadoopConf, userDir)
+    println(
+      s"[HFileWriter] staging roots: mr.am=${conf.get(\"yarn.app.mapreduce.am.staging-dir\")}, " +
+        s"mr.root=${conf.get(\"mapreduce.jobtracker.staging.root.dir\")}, " +
+        s"hbase.tmp=${conf.get(HConstants.TEMPORARY_FS_DIRECTORY_KEY)}"
+    )
 
     // 2. 连接 HBase，configureIncrementalLoad 会从表的列族读取压缩、BloomFilter 等参数
     val tn = TableName.valueOf(tableName)
@@ -108,6 +113,7 @@ object HFileWriter {
     conf.set("yarn.app.mapreduce.am.staging-dir", s"$base/.staging/yarn")
     conf.set("mapreduce.jobtracker.staging.root.dir", s"$base/.staging/mapred")
     conf.set("hadoop.tmp.dir", s"$base/.staging/tmp")
+    conf.set(HConstants.TEMPORARY_FS_DIRECTORY_KEY, s"$base/.staging/hbase_tmp")
     conf.set("mapreduce.cluster.local.dir", s"$base/.staging/local")
     conf.set("mapreduce.job.local.dir", s"$base/.staging/job_local")
     conf.set("mapreduce.cluster.temp.dir", s"$base/.staging/cluster_tmp")

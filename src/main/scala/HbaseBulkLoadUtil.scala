@@ -6,7 +6,7 @@ import org.apache.hadoop.hbase.client.{
   RegionLocator,
   Table
 }
-import org.apache.hadoop.hbase.{HBaseConfiguration, KeyValue, TableName}
+import org.apache.hadoop.hbase.{HBaseConfiguration, HConstants, KeyValue, TableName}
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable
 import org.apache.hadoop.hbase.mapreduce.HFileOutputFormat2
 import org.apache.hadoop.hbase.tool.BulkLoadHFiles
@@ -116,6 +116,11 @@ object HbaseBulkLoadUtil {
     // 统一设置 staging 目录，解决 /user/hadoop 权限问题
     setStagingDirs(hbaseConf, userBase)
     setStagingDirs(sparkHadoopConf, userBase)
+    println(
+      s"[BulkLoad] staging roots: mr.am=${hbaseConf.get(\"yarn.app.mapreduce.am.staging-dir\")}, " +
+        s"mr.root=${hbaseConf.get(\"mapreduce.jobtracker.staging.root.dir\")}, " +
+        s"hbase.tmp=${hbaseConf.get(HConstants.TEMPORARY_FS_DIRECTORY_KEY)}"
+    )
 
     // ========================================
     // 3. 提取列名并严格按字典序排列
@@ -247,6 +252,7 @@ object HbaseBulkLoadUtil {
     conf.set("mapreduce.jobtracker.staging.root.dir", s"$base/.staging/mapred")
     conf.set("yarn.app.mapreduce.am.staging-dir", s"$base/.staging/yarn")
     conf.set("hadoop.tmp.dir", s"$base/.staging/hadoop_tmp")
+    conf.set(HConstants.TEMPORARY_FS_DIRECTORY_KEY, s"$base/.staging/hbase_tmp")
     conf.set("mapreduce.cluster.local.dir", s"$base/.staging/local")
     conf.set("mapreduce.job.local.dir", s"$base/.staging/job_local")
     conf.set("mapreduce.cluster.temp.dir", s"$base/.staging/cluster_tmp")
