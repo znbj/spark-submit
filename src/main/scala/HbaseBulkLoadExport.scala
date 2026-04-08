@@ -9,7 +9,44 @@ import org.apache.hadoop.mapreduce.Job
 import org.apache.spark.Partitioner
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
-object HFileWriter {
+object HbaseBulkLoadExport {
+
+  private type BulkLoadKey = (Array[Byte], Array[Byte])
+
+  private object BulkLoadKeyOrdering extends Ordering[BulkLoadKey] with Serializable {
+    override def compare(a: BulkLoadKey, b: BulkLoadKey): Int = {
+      val rowCompare = Bytes.compareTo(a._1, b._1)
+      if (rowCompare != 0) rowCompare
+      else Bytes.compareTo(a._2, b._2)
+    }
+  }
+
+  private final class RegionStartKeyPartitioner(splitKeys: Array[Array[Byte]])
+      extends Partitioner
+      with Serializable {
+    require(splitKeys.nonEmpty, "splitKeys must not be empty")
+
+    override def numPartitions: Int = splitKeys.length
+
+    override def getPartition(key: Any): Int = {
+      val rowKey = key.asInstanceOf[BulkLoadKey]._1
+      var low = 1
+      var high = splitKeys.length - 1
+      var region = 0
+
+      while (low <= high) {
+        val mid = (low + high) >>> 1
+        val cmp = Bytes.compareTo(rowKey, splitKeys(mid))
+        if (cmp >= 0) {
+          region = mid
+          low = mid + 1
+        } else {
+          high = mid - 1
+        }
+      }
+      region
+    }
+  }
 
   /**
    * 将 DataFrame 生成 HFile 写到 HDFS 指定路径。
@@ -24,7 +61,7 @@ object HFileWriter {
    * @param zkPort        ZooKeeper 端口，默认 2181
    * @param userDir       当前用户 HDFS 根目录，用于 staging，默认 /user/aiip_001
    */
-  def write(
+  def bulkLoadHbase(
       spark: SparkSession,
       df: DataFrame,
       zkQuorum: String,
@@ -48,7 +85,7 @@ object HFileWriter {
     setStagingDirs(conf, userDir)
     setStagingDirs(sparkHadoopConf, userDir)
     println(
-      s"[HFileWriter] staging roots: mr.am=${conf.get(\"yarn.app.mapreduce.am.staging-dir\")}, " +
+      s"[HbaseBulkLoadExport] staging roots: mr.am=${conf.get(\"yarn.app.mapreduce.am.staging-dir\")}, " +
         s"mr.root=${conf.get(\"mapreduce.jobtracker.staging.root.dir\")}, " +
         s"hbase.tmp=${conf.get(HConstants.TEMPORARY_FS_DIRECTORY_KEY)}"
     )
@@ -63,7 +100,7 @@ object HFileWriter {
       val job = Job.getInstance(conf)
       HFileOutputFormat2.configureIncrementalLoad(job, table, regionLocator)
       val startKeys = regionLocator.getStartKeys
-      println(s"[HFileWriter] HBase表共 ${startKeys.length} 个Region")
+      println(s"[HbaseBulkLoadExport] HBase表共 ${startKeys.length} 个Region")
 
       val cf  = Bytes.toBytes(columnFamily)
       val ts  = System.currentTimeMillis()
@@ -71,51 +108,7 @@ object HFileWriter {
       val cols = df.columns.filter(_ != rowKeyCol).sorted
 
       // 3. 转换为 (排序键, KeyValue)
-      final case class BulkLoadKey(rowKey: Array[Byte], qualifier: Array[Byte]) {
-        override def equals(obj: Any): Boolean = obj match {
-          case that: BulkLoadKey =>
-            java.util.Arrays.equals(this.rowKey, that.rowKey) &&
-              java.util.Arrays.equals(this.qualifier, that.qualifier)
-          case _ => false
-        }
-
-        override def hashCode(): Int = {
-          31 * java.util.Arrays.hashCode(rowKey) + java.util.Arrays.hashCode(qualifier)
-        }
-      }
-
-      implicit val keyOrdering: Ordering[BulkLoadKey] = new Ordering[BulkLoadKey] {
-        override def compare(a: BulkLoadKey, b: BulkLoadKey): Int = {
-          val rowCompare = Bytes.compareTo(a.rowKey, b.rowKey)
-          if (rowCompare != 0) rowCompare
-          else Bytes.compareTo(a.qualifier, b.qualifier)
-        }
-      }
-
-      final class RegionStartKeyPartitioner(splitKeys: Array[Array[Byte]]) extends Partitioner {
-        require(splitKeys.nonEmpty, "splitKeys must not be empty")
-
-        override def numPartitions: Int = splitKeys.length
-
-        override def getPartition(key: Any): Int = {
-          val rowKey = key.asInstanceOf[BulkLoadKey].rowKey
-          var low = 1
-          var high = splitKeys.length - 1
-          var region = 0
-
-          while (low <= high) {
-            val mid = (low + high) >>> 1
-            val cmp = Bytes.compareTo(rowKey, splitKeys(mid))
-            if (cmp >= 0) {
-              region = mid
-              low = mid + 1
-            } else {
-              high = mid - 1
-            }
-          }
-          region
-        }
-      }
+      implicit val keyOrdering: Ordering[BulkLoadKey] = BulkLoadKeyOrdering
 
       val kvRdd = df.rdd.flatMap { row =>
         val rk = row.getAs[Any](rowKeyCol)
@@ -129,7 +122,7 @@ object HFileWriter {
             else {
               val qualifierBytes = Bytes.toBytes(col)
               val kv = new KeyValue(rkBytes, cf, qualifierBytes, ts, Bytes.toBytes(v.toString))
-              Iterator.single((BulkLoadKey(rkBytes, qualifierBytes), kv))
+              Iterator.single((((rkBytes, qualifierBytes): BulkLoadKey), kv))
             }
           }
         }
@@ -139,7 +132,7 @@ object HFileWriter {
       val sorted = kvRdd
         .repartitionAndSortWithinPartitions(new RegionStartKeyPartitioner(startKeys))
         .map { case (sortKey, kv) =>
-          (new ImmutableBytesWritable(sortKey.rowKey), kv)
+          (new ImmutableBytesWritable(sortKey._1), kv)
         }
 
       // 5. 写出 HFile
@@ -155,15 +148,15 @@ object HFileWriter {
 
       // 6. 直接执行 BulkLoad 导入 HBase
       val tempPath = new Path(outputPath)
-      println(s"[HFileWriter] 开始BulkLoad导入: $outputPath")
+      println(s"[HbaseBulkLoadExport] 开始BulkLoad导入: $outputPath")
       val bulkLoader = BulkLoadHFiles.create(job.getConfiguration)
       bulkLoader.bulkLoad(tn, tempPath)
-      println(s"[HFileWriter] BulkLoad导入完成: $tableName")
+      println(s"[HbaseBulkLoadExport] BulkLoad导入完成: $tableName")
 
       val fs = FileSystem.get(job.getConfiguration)
       if (fs.exists(tempPath)) {
         fs.delete(tempPath, true)
-        println(s"[HFileWriter] 临时HFile目录已清理: $outputPath")
+        println(s"[HbaseBulkLoadExport] 临时HFile目录已清理: $outputPath")
       }
 
     } finally {
