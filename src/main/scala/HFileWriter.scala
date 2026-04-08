@@ -1,9 +1,12 @@
-import org.apache.hadoop.hbase.{CellUtil, HBaseConfiguration, HConstants, KeyValue, TableName}
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.hbase.{HBaseConfiguration, HConstants, KeyValue, TableName}
 import org.apache.hadoop.hbase.client.ConnectionFactory
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable
 import org.apache.hadoop.hbase.mapreduce.HFileOutputFormat2
+import org.apache.hadoop.hbase.tool.BulkLoadHFiles
 import org.apache.hadoop.hbase.util.Bytes
 import org.apache.hadoop.mapreduce.Job
+import org.apache.spark.Partitioner
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
 object HFileWriter {
@@ -59,13 +62,61 @@ object HFileWriter {
     try {
       val job = Job.getInstance(conf)
       HFileOutputFormat2.configureIncrementalLoad(job, table, regionLocator)
+      val startKeys = regionLocator.getStartKeys
+      println(s"[HFileWriter] HBase表共 ${startKeys.length} 个Region")
 
       val cf  = Bytes.toBytes(columnFamily)
       val ts  = System.currentTimeMillis()
       // 排除 rowKey 列，其余列按字典序排序（HFile 要求 qualifier 有序）
       val cols = df.columns.filter(_ != rowKeyCol).sorted
 
-      // 3. 转换为 (ImmutableBytesWritable, KeyValue)
+      // 3. 转换为 (排序键, KeyValue)
+      final case class BulkLoadKey(rowKey: Array[Byte], qualifier: Array[Byte]) {
+        override def equals(obj: Any): Boolean = obj match {
+          case that: BulkLoadKey =>
+            java.util.Arrays.equals(this.rowKey, that.rowKey) &&
+              java.util.Arrays.equals(this.qualifier, that.qualifier)
+          case _ => false
+        }
+
+        override def hashCode(): Int = {
+          31 * java.util.Arrays.hashCode(rowKey) + java.util.Arrays.hashCode(qualifier)
+        }
+      }
+
+      implicit val keyOrdering: Ordering[BulkLoadKey] = new Ordering[BulkLoadKey] {
+        override def compare(a: BulkLoadKey, b: BulkLoadKey): Int = {
+          val rowCompare = Bytes.compareTo(a.rowKey, b.rowKey)
+          if (rowCompare != 0) rowCompare
+          else Bytes.compareTo(a.qualifier, b.qualifier)
+        }
+      }
+
+      final class RegionStartKeyPartitioner(splitKeys: Array[Array[Byte]]) extends Partitioner {
+        require(splitKeys.nonEmpty, "splitKeys must not be empty")
+
+        override def numPartitions: Int = splitKeys.length
+
+        override def getPartition(key: Any): Int = {
+          val rowKey = key.asInstanceOf[BulkLoadKey].rowKey
+          var low = 1
+          var high = splitKeys.length - 1
+          var region = 0
+
+          while (low <= high) {
+            val mid = (low + high) >>> 1
+            val cmp = Bytes.compareTo(rowKey, splitKeys(mid))
+            if (cmp >= 0) {
+              region = mid
+              low = mid + 1
+            } else {
+              high = mid - 1
+            }
+          }
+          region
+        }
+      }
+
       val kvRdd = df.rdd.flatMap { row =>
         val rk = row.getAs[Any](rowKeyCol)
         if (rk == null || rk.toString.trim.isEmpty) {
@@ -76,20 +127,20 @@ object HFileWriter {
             val v = row.getAs[Any](col)
             if (v == null) Iterator.empty
             else {
-              val kv = new KeyValue(rkBytes, cf, Bytes.toBytes(col), ts, Bytes.toBytes(v.toString))
-              Iterator.single((new ImmutableBytesWritable(rkBytes), kv))
+              val qualifierBytes = Bytes.toBytes(col)
+              val kv = new KeyValue(rkBytes, cf, qualifierBytes, ts, Bytes.toBytes(v.toString))
+              Iterator.single((BulkLoadKey(rkBytes, qualifierBytes), kv))
             }
           }
         }
       }
 
-      // 4. 按 rowkey、qualifier 字节序全局排序（HFileOutputFormat2 强制要求有序输入）
-      // Scala 2.12 对 trait SAM 推断不稳定，用匿名类显式实现 Ordering
-      implicit val byteOrd: Ordering[Array[Byte]] = new Ordering[Array[Byte]] {
-        override def compare(a: Array[Byte], b: Array[Byte]): Int = Bytes.compareTo(a, b)
-      }
-      // HBase 2.x KeyValue 无 getQualifier()，用 CellUtil.cloneQualifier
-      val sorted = kvRdd.sortBy { case (k, kv) => (k.get(), CellUtil.cloneQualifier(kv)) }
+      // 4. 大数据量下避免全局 sortBy 双重开销，改为按 Region 分区并在分区内排序
+      val sorted = kvRdd
+        .repartitionAndSortWithinPartitions(new RegionStartKeyPartitioner(startKeys))
+        .map { case (sortKey, kv) =>
+          (new ImmutableBytesWritable(sortKey.rowKey), kv)
+        }
 
       // 5. 写出 HFile
       sorted.saveAsNewAPIHadoopFile(
@@ -101,6 +152,19 @@ object HFileWriter {
       )
 
       println(s"HFile 生成完成: $outputPath")
+
+      // 6. 直接执行 BulkLoad 导入 HBase
+      val tempPath = new Path(outputPath)
+      println(s"[HFileWriter] 开始BulkLoad导入: $outputPath")
+      val bulkLoader = BulkLoadHFiles.create(job.getConfiguration)
+      bulkLoader.bulkLoad(tn, tempPath)
+      println(s"[HFileWriter] BulkLoad导入完成: $tableName")
+
+      val fs = FileSystem.get(job.getConfiguration)
+      if (fs.exists(tempPath)) {
+        fs.delete(tempPath, true)
+        println(s"[HFileWriter] 临时HFile目录已清理: $outputPath")
+      }
 
     } finally {
       regionLocator.close()
