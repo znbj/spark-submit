@@ -115,7 +115,9 @@ object HbaseBulkLoadExport {
         if (rk == null || rk.toString.trim.isEmpty) {
           Iterator.empty
         } else {
-          val rkBytes = Bytes.toBytes(rk.toString)
+          val rewrittenRowKey =
+            RowKeyTransformUtil.rewriteFirstFieldWithMd5(rk.toString)
+          val rkBytes = Bytes.toBytes(rewrittenRowKey)
           cols.iterator.flatMap { col =>
             val v = row.getAs[Any](col)
             if (v == null) Iterator.empty

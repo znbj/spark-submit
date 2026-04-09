@@ -140,7 +140,9 @@ object HbaseBulkLoadUtil {
       if (rowKeyVal == null || rowKeyVal.toString.trim.isEmpty) {
         Iterator.empty
       } else {
-        val rkBytes = Bytes.toBytes(rowKeyVal.toString)
+        val rewrittenRowKey =
+          RowKeyTransformUtil.rewriteFirstFieldWithMd5(rowKeyVal.toString)
+        val rkBytes = Bytes.toBytes(rewrittenRowKey)
         sortedColumns.iterator.flatMap { colName =>
           val value = row.getAs[Any](colName)
           if (value != null) {
@@ -177,6 +179,9 @@ object HbaseBulkLoadUtil {
       // 获取 Region 起始键用于精确分区
       val startKeys = regionLocator.getStartKeys
       println(s"[BulkLoad] HBase表共 ${startKeys.length} 个Region")
+      BulkLoadDiagnostics
+        .formatRegionBoundarySummary(startKeys)
+        .foreach(line => println(s"[BulkLoad] $line"))
 
       // configureIncrementalLoad 内部会设置 MapOutputKeyClass 等，无需手动设置
       val job = Job.getInstance(hbaseConf)
@@ -225,6 +230,14 @@ object HbaseBulkLoadUtil {
     } catch {
       case e: Exception =>
         System.err.println(s"[BulkLoad] 失败: ${e.getMessage}")
+        BulkLoadDiagnostics
+          .describeExceptionChain(e)
+          .foreach(line => System.err.println(s"[BulkLoad] $line"))
+        if (BulkLoadDiagnostics.looksLikeRegionMovementIssue(e)) {
+          System.err.println(
+            "[BulkLoad] 检测到疑似 region split/move 或 region 边界不稳定。请同时核查目标表 region 变更和生成 HFile 的 rowkey 边界。"
+          )
+        }
         e.printStackTrace()
         // 异常时也尝试清理临时目录
         try {
@@ -290,21 +303,7 @@ class RegionPartitioner(splitKeys: Array[Array[Byte]]) extends Partitioner {
     }
 
     // 二分查找：找到 rowKey 所属的 Region
-    var low = 1 // splitKeys(0) 是空字节数组，跳过
-    var high = splitKeys.length - 1
-    var region = 0
-
-    while (low <= high) {
-      val mid = (low + high) >>> 1
-      val cmp = Bytes.compareTo(rowKey, splitKeys(mid))
-      if (cmp >= 0) {
-        region = mid
-        low = mid + 1
-      } else {
-        high = mid - 1
-      }
-    }
-    region
+    BulkLoadDiagnostics.findRegionIndex(splitKeys, rowKey)
   }
 
 }
