@@ -70,7 +70,8 @@ object HbaseBulkLoadExport {
       rowKeyCol: String,
       outputPath: String,
       zkPort: String = "2181",
-      userDir: String = "/user/aiip_001"
+      userDir: String = "/user/aiip_001",
+      bulkloadFsUri: String = null
   ): Unit = {
 
     // 1. HBase 配置
@@ -78,17 +79,22 @@ object HbaseBulkLoadExport {
     val conf = HBaseConfiguration.create(sparkHadoopConf)
     conf.set("hbase.zookeeper.quorum", zkQuorum)
     conf.set("hbase.zookeeper.property.clientPort", zkPort)
+    val qualifiedUserDir =
+      BulkLoadPathSupport.qualifyBasePath(userDir, bulkloadFsUri)
+    val qualifiedOutputPath =
+      BulkLoadPathSupport.qualifyBasePath(outputPath, bulkloadFsUri)
     // staging 目录定向到有权限的路径，避免访问 /user/hadoop。
     // 必须同时设置 conf 和 sparkHadoopConf：
     //   conf          -> Job.getInstance(conf) -> saveAsNewAPIHadoopFile 的 outputFormat 配置
     //   sparkHadoopConf -> Spark task 执行时合并进 task 配置，若不设则集群默认覆盖上面的设置
-    setStagingDirs(conf, userDir)
-    setStagingDirs(sparkHadoopConf, userDir)
+    setStagingDirs(conf, qualifiedUserDir)
+    setStagingDirs(sparkHadoopConf, qualifiedUserDir)
     println(
       s"[HbaseBulkLoadExport] staging roots: mr.am=${conf.get(\"yarn.app.mapreduce.am.staging-dir\")}, " +
         s"mr.root=${conf.get(\"mapreduce.jobtracker.staging.root.dir\")}, " +
         s"hbase.tmp=${conf.get(HConstants.TEMPORARY_FS_DIRECTORY_KEY)}"
     )
+    println(s"[HbaseBulkLoadExport] bulkload base path: $qualifiedUserDir")
 
     // 2. 连接 HBase，configureIncrementalLoad 会从表的列族读取压缩、BloomFilter 等参数
     val tn = TableName.valueOf(tableName)
@@ -139,26 +145,26 @@ object HbaseBulkLoadExport {
 
       // 5. 写出 HFile
       sorted.saveAsNewAPIHadoopFile(
-        outputPath,
+        qualifiedOutputPath,
         classOf[ImmutableBytesWritable],
         classOf[KeyValue],
         classOf[HFileOutputFormat2],
         job.getConfiguration
       )
 
-      println(s"HFile 生成完成: $outputPath")
+      println(s"HFile 生成完成: $qualifiedOutputPath")
 
       // 6. 直接执行 BulkLoad 导入 HBase
-      val tempPath = new Path(outputPath)
-      println(s"[HbaseBulkLoadExport] 开始BulkLoad导入: $outputPath")
+      val tempPath = new Path(qualifiedOutputPath)
+      println(s"[HbaseBulkLoadExport] 开始BulkLoad导入: $qualifiedOutputPath")
       val bulkLoader = BulkLoadHFiles.create(job.getConfiguration)
       bulkLoader.bulkLoad(tn, tempPath)
       println(s"[HbaseBulkLoadExport] BulkLoad导入完成: $tableName")
 
-      val fs = FileSystem.get(job.getConfiguration)
+      val fs = tempPath.getFileSystem(job.getConfiguration)
       if (fs.exists(tempPath)) {
         fs.delete(tempPath, true)
-        println(s"[HbaseBulkLoadExport] 临时HFile目录已清理: $outputPath")
+        println(s"[HbaseBulkLoadExport] 临时HFile目录已清理: $qualifiedOutputPath")
       }
 
     } finally {
@@ -169,12 +175,33 @@ object HbaseBulkLoadExport {
   }
 
   private def setStagingDirs(conf: org.apache.hadoop.conf.Configuration, base: String): Unit = {
-    conf.set("yarn.app.mapreduce.am.staging-dir", s"$base/.staging/yarn")
-    conf.set("mapreduce.jobtracker.staging.root.dir", s"$base/.staging/mapred")
-    conf.set("hadoop.tmp.dir", s"$base/.staging/tmp")
-    conf.set(HConstants.TEMPORARY_FS_DIRECTORY_KEY, s"$base/.staging/hbase_tmp")
-    conf.set("mapreduce.cluster.local.dir", s"$base/.staging/local")
-    conf.set("mapreduce.job.local.dir", s"$base/.staging/job_local")
-    conf.set("mapreduce.cluster.temp.dir", s"$base/.staging/cluster_tmp")
+    conf.set(
+      "yarn.app.mapreduce.am.staging-dir",
+      BulkLoadPathSupport.childPath(base, ".staging/yarn")
+    )
+    conf.set(
+      "mapreduce.jobtracker.staging.root.dir",
+      BulkLoadPathSupport.childPath(base, ".staging/mapred")
+    )
+    conf.set(
+      "hadoop.tmp.dir",
+      BulkLoadPathSupport.childPath(base, ".staging/tmp")
+    )
+    conf.set(
+      HConstants.TEMPORARY_FS_DIRECTORY_KEY,
+      BulkLoadPathSupport.childPath(base, ".staging/hbase_tmp")
+    )
+    conf.set(
+      "mapreduce.cluster.local.dir",
+      BulkLoadPathSupport.childPath(base, ".staging/local")
+    )
+    conf.set(
+      "mapreduce.job.local.dir",
+      BulkLoadPathSupport.childPath(base, ".staging/job_local")
+    )
+    conf.set(
+      "mapreduce.cluster.temp.dir",
+      BulkLoadPathSupport.childPath(base, ".staging/cluster_tmp")
+    )
   }
 }
