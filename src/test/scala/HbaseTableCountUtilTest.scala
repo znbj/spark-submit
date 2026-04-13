@@ -1,5 +1,8 @@
 import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter
+import org.example.HbaseTableCountUtil
 import org.scalatest.funsuite.AnyFunSuite
+
+import java.util.{Arrays, Optional}
 
 class HbaseTableCountUtilTest extends AnyFunSuite {
 
@@ -30,22 +33,26 @@ class HbaseTableCountUtilTest extends AnyFunSuite {
       )
     )
 
-    assert(config.tableName === "default:user_info_hbase")
-    assert(config.method === "spark")
-    assert(config.zkQuorum.contains("zk1,zk2,zk3"))
-    assert(config.families === Seq("cf1", "cf2"))
-    assert(config.startRow.contains("rk001"))
-    assert(config.stopRow.contains("rk999"))
-    assert(config.scanCaching === 2048)
+    assert(config.getTableName === "default:user_info_hbase")
+    assert(config.getMethod === "spark")
+    assert(config.getZkQuorum.get() === "zk1,zk2,zk3")
+    assert(config.getFamilies === Arrays.asList("cf1", "cf2"))
+    assert(config.getStartRow.get() === "rk001")
+    assert(config.getStopRow.get() === "rk999")
+    assert(config.getScanCaching === 2048)
   }
 
   test("buildScan applies large-table count optimizations") {
-    val config = HbaseTableCountUtil.CountConfig(
-      tableName = "default:user_info_hbase",
-      startRow = Some("rk001"),
-      stopRow = Some("rk999"),
-      families = Seq("cf"),
-      scanCaching = 4096
+    val config = new HbaseTableCountUtil.CountConfig(
+      "default:user_info_hbase",
+      "auto",
+      Optional.empty[String](),
+      "2181",
+      "/hbase",
+      Optional.of("rk001"),
+      Optional.of("rk999"),
+      Arrays.asList("cf"),
+      4096
     )
 
     val scan = HbaseTableCountUtil.buildScan(config)
