@@ -89,12 +89,21 @@ object HbaseBulkLoadExport {
     //   sparkHadoopConf -> Spark task 执行时合并进 task 配置，若不设则集群默认覆盖上面的设置
     setStagingDirs(conf, qualifiedUserDir)
     setStagingDirs(sparkHadoopConf, qualifiedUserDir)
+    BulkLoadPathSupport
+      .describePathConfiguration(qualifiedUserDir, conf)
+      .foreach(line => println(s"[HbaseBulkLoadExport] $line"))
+    BulkLoadPathSupport
+      .describePathConfiguration(qualifiedOutputPath, conf)
+      .foreach(line => println(s"[HbaseBulkLoadExport] output $line"))
+    BulkLoadPathSupport.requireResolvable(qualifiedUserDir, conf)
+    BulkLoadPathSupport.requireResolvable(qualifiedOutputPath, conf)
     println(
-      s"[HbaseBulkLoadExport] staging roots: mr.am=${conf.get(\"yarn.app.mapreduce.am.staging-dir\")}, " +
-        s"mr.root=${conf.get(\"mapreduce.jobtracker.staging.root.dir\")}, " +
+      s"[HbaseBulkLoadExport] staging roots: mr.am=${conf.get("yarn.app.mapreduce.am.staging-dir")}, " +
+        s"mr.root=${conf.get("mapreduce.jobtracker.staging.root.dir")}, " +
         s"hbase.tmp=${conf.get(HConstants.TEMPORARY_FS_DIRECTORY_KEY)}"
     )
     println(s"[HbaseBulkLoadExport] bulkload base path: $qualifiedUserDir")
+    println(s"[HbaseBulkLoadExport] bulkload output path: $qualifiedOutputPath")
 
     // 2. 连接 HBase，configureIncrementalLoad 会从表的列族读取压缩、BloomFilter 等参数
     val tn = TableName.valueOf(tableName)

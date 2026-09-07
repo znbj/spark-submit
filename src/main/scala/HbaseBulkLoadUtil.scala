@@ -122,9 +122,17 @@ object HbaseBulkLoadUtil {
     // 统一设置 staging 目录，解决 /user/hadoop 权限问题
     setStagingDirs(hbaseConf, qualifiedUserBase)
     setStagingDirs(sparkHadoopConf, qualifiedUserBase)
+    BulkLoadPathSupport
+      .describePathConfiguration(qualifiedUserBase, hbaseConf)
+      .foreach(line => println(s"[BulkLoad] $line"))
+    BulkLoadPathSupport
+      .describePathConfiguration(hdfsTempPath, hbaseConf)
+      .foreach(line => println(s"[BulkLoad] output $line"))
+    BulkLoadPathSupport.requireResolvable(qualifiedUserBase, hbaseConf)
+    BulkLoadPathSupport.requireResolvable(hdfsTempPath, hbaseConf)
     println(
-      s"[BulkLoad] staging roots: mr.am=${hbaseConf.get(\"yarn.app.mapreduce.am.staging-dir\")}, " +
-        s"mr.root=${hbaseConf.get(\"mapreduce.jobtracker.staging.root.dir\")}, " +
+      s"[BulkLoad] staging roots: mr.am=${hbaseConf.get("yarn.app.mapreduce.am.staging-dir")}, " +
+        s"mr.root=${hbaseConf.get("mapreduce.jobtracker.staging.root.dir")}, " +
         s"hbase.tmp=${hbaseConf.get(HConstants.TEMPORARY_FS_DIRECTORY_KEY)}"
     )
     println(s"[BulkLoad] bulkload base path: $qualifiedUserBase")
